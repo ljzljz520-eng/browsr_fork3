@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 from rich.console import RenderableType
 from rich.text import Text
@@ -11,10 +12,10 @@ from textual_universal_directorytree import (
     GitHubTextualPath,
     S3TextualPath,
     SFTPTextualPath,
-    is_remote_path,
+    UPath,
 )
 
-from browsr.utils import FileInfo
+from browsr.utils import FileInfo, is_remote
 
 
 class CurrentFileInfoBar(Widget):
@@ -76,7 +77,29 @@ class CurrentFileInfoBar(Widget):
             status_string += f"  📅  {modify_time}"
         directory_options = self.render_directory_options()
         status_string += directory_options
+        archive_options = self.render_archive_options()
+        status_string += archive_options
         return Text(status_string.strip(), style="dim")
+
+    def render_archive_options(self) -> str:
+        """
+        Render the parent-archive context (and any archive error)
+        """
+        status_string = ""
+        if not self.file_info:
+            return status_string
+        if (
+            self.file_info.is_archive_member
+            and self.file_info.parent_archive is not None
+        ):
+            archive_name = self.file_info.parent_archive.name
+            entry = self.file_info.archive_entry or ""
+            status_string += f"  📦  {archive_name}"
+            if entry:
+                status_string += f"::{entry}"
+        if self.file_info.archive_error:
+            status_string += f"  ⚠️  {self.file_info.archive_error}"
+        return status_string
 
     def render_file_options(self) -> str:
         """
@@ -101,21 +124,30 @@ class CurrentFileInfoBar(Widget):
         status_string = ""
         if not self.file_info:
             return status_string
+        if self.file_info.is_archive_member:
+            # Archive members carry their in-archive directory identity.
+            if self.file_info.is_file:
+                archive_entry = self.file_info.archive_entry or ""
+                parent_name = archive_entry.rpartition("/")[0]
+                if parent_name:
+                    status_string += f"  📂  {parent_name}"
+                status_string += f"  💾  {self.file_info.file.name}"
+            else:
+                status_string += f"  📂  {self.file_info.file.name}"
+            return status_string
+        file_path = cast(UPath, self.file_info.file)
         if self.file_info.is_file:
-            directory_name = self.file_info.file.parent.name
+            directory_name = file_path.parent.name
             if not directory_name or (
-                self.file_info.file.protocol
-                and f"{self.file_info.file.protocol}://" in directory_name
+                file_path.protocol and f"{file_path.protocol}://" in directory_name
             ):
-                directory_name = str(self.file_info.file.parent)
-                directory_name = directory_name.lstrip(
-                    f"{self.file_info.file.protocol}://"
-                )
+                directory_name = str(file_path.parent)
+                directory_name = directory_name.lstrip(f"{file_path.protocol}://")
                 directory_name = directory_name.rstrip("/")
             status_string += f"  📂  {directory_name}"
-            status_string += f"  💾  {self.file_info.file.name}"
+            status_string += f"  💾  {file_path.name}"
         else:
-            status_string += f"  📂  {self.file_info.file.name}"
+            status_string += f"  📂  {file_path.name}"
         return status_string
 
     def render_file_protocol(self) -> str:
@@ -125,14 +157,15 @@ class CurrentFileInfoBar(Widget):
         status_string = ""
         if not self.file_info:
             return status_string
-        if is_remote_path(self.file_info.file):
-            if isinstance(self.file_info.file, GitHubTextualPath):
+        if is_remote(self.file_info.file):
+            file_path = cast(UPath, self.file_info.file)
+            if isinstance(file_path, GitHubTextualPath):
                 protocol = "GitHub"
-            elif isinstance(self.file_info.file, S3TextualPath):
+            elif isinstance(file_path, S3TextualPath):
                 protocol = "S3"
-            elif isinstance(self.file_info.file, SFTPTextualPath):
+            elif isinstance(file_path, SFTPTextualPath):
                 protocol = "SFTP"
             else:
-                protocol = self.file_info.file.protocol
+                protocol = file_path.protocol
             status_string += f"🗂️  {protocol}"
         return status_string

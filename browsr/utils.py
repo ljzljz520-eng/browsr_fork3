@@ -15,6 +15,14 @@ from PIL import Image
 from rich_pixels import Pixels
 from textual_universal_directorytree import UPath, is_remote_path
 
+from browsr.archive import (
+    ArchiveError,
+    ArchiveMemberPath,
+    ArchiveProblemPath,
+    is_archive_path,
+    materialize_member,
+)
+
 
 def _open_pdf_as_image(buf: BinaryIO) -> Image.Image:
     """
@@ -27,22 +35,72 @@ def _open_pdf_as_image(buf: BinaryIO) -> Image.Image:
     return image
 
 
-def open_image(document: UPath, screen_width: float) -> Pixels:
+def _resize_image(image: Image.Image, screen_width: float) -> Pixels:
+    """
+    Resize a PIL image and convert it to Pixels
+    """
+    image_width = image.width
+    image_height = image.height
+    size_ratio = image_width / screen_width
+    new_width = int(image_width / size_ratio)
+    new_height = int(image_height / size_ratio)
+    resized = image.resize((new_width, new_height))
+    return Pixels.from_image(resized)
+
+
+def _image_from_buffer(buf: BinaryIO, suffix: str, screen_width: float) -> Pixels:
+    """
+    Render an image (or the first PDF page) from an open binary buffer
+    """
+    if suffix.lower() == ".pdf":
+        image = _open_pdf_as_image(buf=buf)
+    else:
+        image = Image.open(buf)
+    return _resize_image(image=image, screen_width=screen_width)
+
+
+def open_image(
+    document: UPath | Path,
+    screen_width: float,
+    max_bytes: int | None = None,
+) -> Pixels:
     """
     Open an image file and return a rich_pixels.Pixels object
+
+    Archive members are first extracted (single-entry, bounded stream) to
+    a temporary file because image / PDF decoders require a seekable
+    buffer. The whole archive is never read into memory.
     """
+    if is_archive_path(document):
+        with materialize_member(
+            document,  # type: ignore[arg-type]
+            suffix=document.suffix,
+            max_bytes=max_bytes,
+        ) as temp_name:
+            with open(temp_name, "rb") as buf:
+                return _image_from_buffer(
+                    buf=buf,
+                    suffix=document.suffix,
+                    screen_width=screen_width,
+                )
     with document.open("rb") as buf:
-        if document.suffix.lower() == ".pdf":
-            image = _open_pdf_as_image(buf=buf)
-        else:
-            image = Image.open(buf)
-        image_width = image.width
-        image_height = image.height
-        size_ratio = image_width / screen_width
-        new_width = int(image_width / size_ratio)
-        new_height = int(image_height / size_ratio)
-        resized = image.resize((new_width, new_height))
-        return Pixels.from_image(resized)
+        return _image_from_buffer(
+            buf=buf,
+            suffix=document.suffix,
+            screen_width=screen_width,
+        )
+
+
+def is_remote(file_path: UPath | Path | Any) -> bool:
+    """
+    Whether a path lives on a remote filesystem.
+
+    Entries inside a *local* archive are considered local even though
+    they are virtual path objects.
+    """
+    if is_archive_path(file_path):
+        return False
+    return is_remote_path(file_path)  # type: ignore[arg-type]
 
 
 @dataclass
@@ -51,7 +109,7 @@ class FileInfo:
     File Information Object
     """
 
-    file: UPath
+    file: UPath | Path | ArchiveMemberPath | ArchiveProblemPath
     size: int
     last_modified: datetime.datetime | None
     stat: dict[str, Any] | os.stat_result
@@ -60,12 +118,70 @@ class FileInfo:
     owner: str
     group: str
     is_cloudpath: bool
+    parent_archive: UPath | Path | None = None
+    archive_entry: str | None = None
+    archive_error: str | None = None
+
+    @property
+    def is_archive_member(self) -> bool:
+        """
+        Whether the file lives inside an archive
+        """
+        return is_archive_path(self.file)
 
 
-def get_file_info(file_path: UPath | Path) -> FileInfo:
+def _archive_file_info(
+    file_path: ArchiveMemberPath | ArchiveProblemPath,
+) -> FileInfo:
+    """
+    Build FileInfo for a virtual archive path node.
+    """
+    archive_error = None
+    if isinstance(file_path, ArchiveProblemPath):
+        archive_error = file_path.message
+        try:
+            stat_result = file_path.stat()
+            is_file = True
+        except ArchiveError as exc:
+            archive_error = str(exc)
+            stat_result = os.stat_result((0o100444, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            is_file = True
+    else:
+        try:
+            stat_result = file_path.stat()
+            is_file = file_path.is_file()
+        except ArchiveError as exc:
+            archive_error = str(exc)
+            stat_result = os.stat_result((0o100444, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            is_file = not file_path.entry_name.endswith("/")
+    mtime = stat_result.st_mtime
+    last_modified = (
+        datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+        if mtime
+        else None
+    )
+    return FileInfo(
+        file=file_path,
+        size=stat_result.st_size,
+        last_modified=last_modified,
+        stat=stat_result,
+        is_local=True,
+        is_file=is_file,
+        owner="",
+        group="",
+        is_cloudpath=False,
+        parent_archive=file_path.parent_archive,
+        archive_entry=file_path.entry_name,
+        archive_error=archive_error,
+    )
+
+
+def get_file_info(file_path: UPath | Path | ArchiveMemberPath) -> FileInfo:
     """
     Get File Information, Regardless of the FileSystem
     """
+    if is_archive_path(file_path):
+        return _archive_file_info(file_path)  # type: ignore[arg-type]
     try:
         stat: dict[str, Any] | os.stat_result = file_path.stat()  # type: ignore[assignment]
         is_file = file_path.is_file()
@@ -75,7 +191,7 @@ def get_file_info(file_path: UPath | Path) -> FileInfo:
     except FileNotFoundError:
         stat = {"size": 0}
         is_file = True
-    is_cloudpath = is_remote_path(file_path)  # type: ignore[arg-type]
+    is_cloudpath = is_remote(file_path)
     if isinstance(stat, dict):
         lower_dict = {key.lower(): value for key, value in stat.items()}
         file_size = lower_dict["size"]
@@ -88,7 +204,7 @@ def get_file_info(file_path: UPath | Path) -> FileInfo:
         if isinstance(last_modified, str):
             last_modified = datetime.datetime.fromisoformat(last_modified[:-1])
         return FileInfo(
-            file=file_path,  # type: ignore[arg-type]
+            file=file_path,
             size=file_size,
             last_modified=last_modified,
             stat=stat,
@@ -109,7 +225,7 @@ def get_file_info(file_path: UPath | Path) -> FileInfo:
             owner = ""
             group = ""
         return FileInfo(
-            file=file_path,  # type: ignore[arg-type]
+            file=file_path,
             size=stat.st_size,
             last_modified=last_modified,
             stat=stat,

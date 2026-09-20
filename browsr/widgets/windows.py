@@ -5,8 +5,9 @@ Content Windows
 from __future__ import annotations
 
 import contextlib
+import io
 from json import JSONDecodeError
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple, cast
 
 import orjson
 import pandas as pd
@@ -25,6 +26,13 @@ from textual.widget import Widget
 from textual.widgets import Static, TextArea
 from textual_universal_directorytree import UPath
 
+from browsr.archive import (
+    ArchiveMemberPath,
+    ArchiveSecurityError,
+    ArchiveUnavailableError,
+    is_archive_path,
+    materialize_member,
+)
 from browsr.base import TextualAppContext
 from browsr.config import (
     favorite_themes,
@@ -82,6 +90,15 @@ class BaseCodeWindow(Widget):
             self.scroll_home: bool = scroll_home
             super().__init__()
 
+    def _max_member_bytes(self) -> int | None:
+        """
+        Byte budget for archive-member reads, from the app config.
+        """
+        config_object = getattr(self, "config_object", None)
+        if config_object is not None:
+            return int(config_object.max_file_size) * 1000 * 1000
+        return None
+
     def file_to_string(
         self, file_path: UPath, max_lines: int | None = None
     ) -> FileToStringResult:
@@ -92,10 +109,19 @@ class BaseCodeWindow(Widget):
         """
         error_occurred = False
         try:
-            if file_path.suffix in self.archive_extensions:
+            if is_archive_path(file_path):
+                # A single archive member is streamed, bounded by the
+                # configured max-file-size budget - the archive itself
+                # is never read into memory.
+                member_path = cast(ArchiveMemberPath, file_path)
+                text = member_path.read_text(
+                    encoding="utf-8", max_bytes=self._max_member_bytes()
+                )
+            elif file_path.suffix in self.archive_extensions:
                 message = f"Cannot render archive file {file_path}."
                 raise ArchiveFileError(message)
-            text = file_path.read_text(encoding="utf-8")
+            else:
+                text = file_path.read_text(encoding="utf-8")
         except Exception as e:
             text = self.handle_exception(exception=e)
             error_occurred = True
@@ -108,7 +134,12 @@ class BaseCodeWindow(Widget):
         Load a file into an image
         """
         screen_width = self.app.size.width / 2
-        content = open_image(document=file_path, screen_width=screen_width)
+        max_bytes = self._max_member_bytes() if is_archive_path(file_path) else None
+        content = open_image(
+            document=file_path,
+            screen_width=screen_width,
+            max_bytes=max_bytes,
+        )
         return content
 
     def file_to_json(self, file_path: UPath, max_lines: int | None = None) -> str:
@@ -145,6 +176,8 @@ class BaseCodeWindow(Widget):
         font = "univers"
         exception_map = {
             ArchiveFileError: ("ARCHIVE", "FILE"),
+            ArchiveSecurityError: ("UNSAFE", "ENTRY"),
+            ArchiveUnavailableError: ("ARCHIVE", "ERROR"),
             FileSizeError: ("FILE TOO", "LARGE"),
             PermissionError: ("PERMISSION", "ERROR"),
             UnicodeError: ("ENCODING", "ERROR"),
@@ -314,11 +347,19 @@ class DataTableWindow(VimDataTable, BaseCodeWindow):
     A DataTable widget for displaying code.
     """
 
+    config_object: TextualAppContext
+    """
+    App config, attached by :class:`WindowSwitcher` so bounded archive
+    reads honor the max-file-size budget.
+    """
+
     def refresh_from_file(self, file_path: UPath, max_lines: int | None = None) -> None:
         """
         Load a file into a DataTable
         """
-        if ".csv" in file_path.suffixes:
+        if is_archive_path(file_path):
+            df = self._read_archive_dataframe(file_path, max_lines=max_lines)
+        elif ".csv" in file_path.suffixes:
             df = pd.read_csv(file_path, nrows=max_lines)
         elif file_path.suffix.lower() in [".parquet"]:
             df = pd.read_parquet(file_path).head(max_lines)
@@ -328,6 +369,38 @@ class DataTableWindow(VimDataTable, BaseCodeWindow):
             msg = f"Cannot render file as a DataTable, {file_path}."
             raise NotImplementedError(msg)
         self.refresh_from_df(df)
+
+    def _read_archive_dataframe(
+        self, file_path: UPath, max_lines: int | None
+    ) -> pd.DataFrame:
+        """
+        Read a tabular archive member without loading the whole archive:
+        CSV members are streamed (bounded), while parquet / feather members
+        are extracted to a single temporary file because their decoders
+        require seekable buffers.
+        """
+        max_bytes = self._max_member_bytes()
+        if ".csv" in file_path.suffixes:
+            with file_path.open("rb", max_bytes=max_bytes) as binary:
+                text_stream = io.TextIOWrapper(binary, encoding="utf-8", newline="")
+                return pd.read_csv(text_stream, nrows=max_lines)
+        elif file_path.suffix.lower() in [".parquet"]:
+            with materialize_member(
+                cast(ArchiveMemberPath, file_path),
+                suffix=file_path.suffix,
+                max_bytes=max_bytes,
+            ) as temp_name:
+                return pd.read_parquet(temp_name).head(max_lines)
+        elif file_path.suffix.lower() in [".feather", ".fea"]:
+            with materialize_member(
+                cast(ArchiveMemberPath, file_path),
+                suffix=file_path.suffix,
+                max_bytes=max_bytes,
+            ) as temp_name:
+                return pd.read_feather(temp_name).head(max_lines)
+        else:
+            msg = f"Cannot render file as a DataTable, {file_path}."
+            raise NotImplementedError(msg)
 
     def refresh_from_df(
         self,
@@ -395,6 +468,10 @@ class WindowSwitcher(Container, ThemeVisibleMixin, LinenosVisibleMixin):
         self.datatable_window = DataTableWindow(
             zebra_stripes=True, show_header=True, show_cursor=True, id="table-view"
         )
+        # DataTableWindow does not take the config through its widget
+        # constructor; attach it so bounded archive-member reads honor
+        # the max-file-size budget.
+        self.datatable_window.config_object = config_object
         self.datatable_window.display = False
         self.vim_scroll = VimScroll(self.static_window)
 
@@ -491,6 +568,18 @@ class WindowSwitcher(Container, ThemeVisibleMixin, LinenosVisibleMixin):
             else:
                 switch_window = self._render_text(file_path)
         except Exception as e:
+            if isinstance(e, (ArchiveSecurityError, ArchiveUnavailableError)):
+                with contextlib.suppress(Exception):
+                    self.app.notify(
+                        message=str(e),
+                        title=(
+                            "Unsafe archive entry"
+                            if isinstance(e, ArchiveSecurityError)
+                            else "Archive unavailable"
+                        ),
+                        severity="warning",
+                        timeout=4,
+                    )
             error_message = self.static_window.handle_exception(exception=e)
             error_syntax = self.static_window.text_to_syntax(
                 text=error_message,

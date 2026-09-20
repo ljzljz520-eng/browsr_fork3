@@ -13,6 +13,7 @@ from textual.binding import ActiveBinding
 from textual.screen import Screen
 from textual_universal_directorytree import UPath
 
+from browsr.archive import ArchiveMemberPath, parse_archive_uri
 from browsr.utils import handle_github_url
 
 
@@ -30,7 +31,7 @@ class TextualAppContext:
     kwargs: dict[str, Any] | None = None
 
     @property
-    def path(self) -> UPath | pathlib.Path:
+    def path(self) -> UPath | pathlib.Path | ArchiveMemberPath:
         """
         Resolve `file_path` to a UPath object
         """
@@ -48,6 +49,10 @@ class TextualAppContext:
         storage_options = self.kwargs or {}
         if not self.file_path:
             return pathlib.Path.cwd().resolve()
+        archive_uri = parse_archive_uri(str(self.file_path))
+        if archive_uri is not None:
+            archive_path, entry_name = archive_uri
+            return ArchiveMemberPath(archive=archive_path, entry_name=entry_name)
         else:
             path = UPath(self.file_path, **storage_options)
             return path.resolve()

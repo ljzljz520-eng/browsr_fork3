@@ -4,9 +4,12 @@ The Primary Content Container
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import os
 import pathlib
 import shutil
+import tempfile
 from typing import Any
 
 import pyperclip
@@ -22,6 +25,13 @@ from textual_universal_directorytree import (
     is_remote_path,
 )
 
+from browsr.archive import (
+    ArchiveError,
+    ArchiveMemberPath,
+    ArchiveProblemPath,
+    is_archive_path,
+    safe_download_name,
+)
 from browsr.base import (
     TextualAppContext,
 )
@@ -72,13 +82,20 @@ class CodeBrowser(Container):
         self.config_object = config_object
         # Path Handling
         file_path = self.config_object.path
-        if not file_path.exists():
+        try:
+            path_exists = file_path.exists()
+            path_is_file = file_path.is_file() if path_exists else False
+            path_is_dir = file_path.is_dir() if path_exists else False
+        except ArchiveError as exc:
+            msg = f"Unable to open archive path: {file_path}"
+            raise FileNotFoundError(msg) from exc
+        if not path_exists:
             msg = f"Unknown File Path: {file_path}"
             raise FileNotFoundError(msg)
-        elif file_path.is_file():
+        elif path_is_file:
             self.selected_file_path = file_path  # type: ignore[assignment]
             file_path = file_path.parent
-        elif file_path.is_dir() and file_path.joinpath("README.md").exists():
+        elif path_is_dir and file_path.joinpath("README.md").exists():
             self.selected_file_path = file_path.joinpath("README.md")  # type: ignore[assignment]
             self.force_show_tree = True
         self.initial_file_path = file_path
@@ -144,10 +161,11 @@ class CodeBrowser(Container):
                 key_display="shift+c",
             )
 
-        if is_remote_path(self.initial_file_path):  # type: ignore[arg-type]
-            self.app.bind(
-                keys="x", action="download_file", description="Download", show=True
-            )
+        # Download is available for remote files and for entries inside
+        # local archives. The workflow is a no-op for ordinary local files.
+        self.app.bind(
+            keys="x", action="download_file", description="Download", show=True
+        )
 
     def watch_show_tree(self, show_tree: bool) -> None:
         """
@@ -322,11 +340,34 @@ class CodeBrowser(Container):
             return
         elif self.selected_file_path.is_dir():
             return
-        elif is_remote_path(self.selected_file_path):
+        elif isinstance(self.selected_file_path, ArchiveProblemPath):
+            self.notify(
+                message=self.selected_file_path.message,
+                title=(
+                    "Unsafe archive entry"
+                    if self.selected_file_path.security
+                    else "Archive error"
+                ),
+                severity="warning",
+                timeout=4,
+            )
+            return
+        elif is_archive_path(self.selected_file_path) or is_remote_path(
+            self.selected_file_path
+        ):
             if self._get_active_overlay() is self.confirmation_window:
                 self._close_overlay(self.confirmation_window)
                 return
-            handled_download_path = self._get_download_file_name()
+            try:
+                handled_download_path = self._get_download_file_name()
+            except Exception as exc:
+                self.notify(
+                    message=f"Cannot download: {exc}",
+                    title="Download Failed",
+                    severity="error",
+                    timeout=4,
+                )
+                return
             self.confirmation.prompt_download(
                 file_path=str(self.selected_file_path),
                 download_path=str(handled_download_path),
@@ -347,31 +388,108 @@ class CodeBrowser(Container):
     def download_selected_file(self) -> None:
         """
         Download the selected file.
+
+        Archive members are streamed (bounded by the configured file-size
+        budget) into a temporary file inside ``Downloads`` and then
+        atomically committed with :func:`os.replace`. Only the selected
+        entry is extracted and only the chosen basename is ever written.
         """
         if self.selected_file_path is None:
             return
         elif self.selected_file_path.is_dir():
             return
-        elif is_remote_path(self.selected_file_path):
+        elif isinstance(self.selected_file_path, ArchiveProblemPath):
+            return
+        try:
             handled_download_path = self._get_download_file_name()
-            with self.selected_file_path.open("rb") as file_handle:
-                with handled_download_path.open("wb") as download_handle:
-                    shutil.copyfileobj(file_handle, download_handle)
+            if is_archive_path(self.selected_file_path):
+                self._download_archive_member(
+                    member_path=self.selected_file_path,  # type: ignore[arg-type]
+                    destination=handled_download_path,
+                )
+            elif is_remote_path(self.selected_file_path):
+                with self.selected_file_path.open("rb") as file_handle:
+                    with handled_download_path.open("wb") as download_handle:
+                        shutil.copyfileobj(file_handle, download_handle)
+                self.notify(
+                    message=str(handled_download_path),
+                    title="Download Complete",
+                    severity="information",
+                    timeout=2,
+                )
+        except Exception as exc:
             self.notify(
-                message=str(handled_download_path),
-                title="Download Complete",
-                severity="information",
-                timeout=2,
+                message=f"Failed to download: {exc}",
+                title="Download Failed",
+                severity="error",
+                timeout=4,
             )
+
+    def _download_archive_member(
+        self,
+        member_path: ArchiveMemberPath,
+        destination: pathlib.Path,
+    ) -> None:
+        """
+        Stream a single archive entry to a temp file and atomically commit.
+        """
+        max_bytes = int(self.config_object.max_file_size) * 1000 * 1000
+        temp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_handle:
+                temp_name = temp_handle.name
+                with member_path.open("rb", max_bytes=max_bytes) as member_handle:
+                    shutil.copyfileobj(member_handle, temp_handle)
+            os.replace(temp_name, destination)
+        except Exception as exc:
+            if temp_name is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temp_name)
+            self.notify(
+                message=f"Failed to download {member_path.name}: {exc}",
+                title="Download Failed",
+                severity="error",
+                timeout=4,
+            )
+            return
+        self.notify(
+            message=str(destination),
+            title="Download Complete",
+            severity="information",
+            timeout=2,
+        )
 
     def _get_download_file_name(self) -> UPath | pathlib.Path:
         """
         Get the download file name.
+
+        For archive entries only the safe basename of the entry is used -
+        the in-archive directory structure is never recreated.
         """
         download_dir = pathlib.Path.home() / "Downloads"
         if not download_dir.exists():
             msg = f"Download directory {download_dir} not found"
             raise FileNotFoundError(msg)
-        download_path = download_dir / self.selected_file_path.name  # type: ignore[union-attr]
+        if is_archive_path(self.selected_file_path):
+            selected_name = safe_download_name(
+                self.selected_file_path.entry_name  # type: ignore[union-attr]
+            )
+        else:
+            selected_name = self.selected_file_path.name  # type: ignore[union-attr]
+        download_path = download_dir / selected_name
+        # Defense in depth: the resolved target must stay inside Downloads.
+        resolved_target = os.fspath(download_path.resolve())
+        resolved_download_dir = os.fspath(download_dir.resolve())
+        if (
+            os.path.commonpath([resolved_target, resolved_download_dir])
+            != resolved_download_dir
+        ):
+            msg = f"Refusing to download outside of {download_dir}"
+            raise ArchiveError(msg)
         handled_download_path = handle_duplicate_filenames(file_path=download_path)
         return handled_download_path
